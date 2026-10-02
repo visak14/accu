@@ -292,7 +292,7 @@ const form = reactive({
 const providerOptions = [
   { label: 'Groq Cloud (Fast & High Quality - Llama 3.3)', value: 'groq' },
   { label: 'OpenAI (GPT-4o-mini)', value: 'openai' },
-  { label: 'Google Gemini (1.5 Flash)', value: 'gemini' },
+  { label: 'Google Gemini (2.0 Flash / 1.5 Flash)', value: 'gemini' },
   { label: 'Anthropic Claude (3.5 Haiku)', value: 'claude' }
 ]
 
@@ -300,7 +300,7 @@ function defaultModelForProvider(prov) {
   switch (prov) {
     case 'groq': return 'llama-3.3-70b-versatile'
     case 'openai': return 'gpt-4o-mini'
-    case 'gemini': return 'gemini-1.5-flash'
+    case 'gemini': return 'gemini-2.0-flash'
     case 'claude': return 'claude-3-5-haiku-20241022'
     default: return 'llama-3.3-70b-versatile'
   }

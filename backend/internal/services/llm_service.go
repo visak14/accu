@@ -273,70 +273,132 @@ func (s *LLMService) callOpenAI(ctx context.Context, apiKey, model, userPrompt s
 	return parsed.Choices[0].Message.Content, nil
 }
 
-// callGemini calls Google Gemini API
+// callGemini calls Google Gemini API with robust model normalization and fallbacks
 func (s *LLMService) callGemini(ctx context.Context, apiKey, model, userPrompt string) (string, error) {
 	if apiKey == "" {
 		return "", fmt.Errorf("Gemini API key is required. Provide it in project upload or set GEMINI_API_KEY in .env")
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+	cleanModel := strings.TrimPrefix(strings.TrimSpace(model), "models/")
+	if cleanModel == "" {
+		cleanModel = "gemini-2.0-flash"
+	}
 
-	reqBody := map[string]interface{}{
-		"contents": []map[string]interface{}{
-			{
-				"role": "user",
-				"parts": []map[string]string{
-					{"text": userPrompt},
-				},
+	// List of candidate models to try in sequence if 404 is encountered
+	candidateModels := []string{cleanModel}
+	for _, fallback := range []string{"gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash-002", "gemini-1.5-pro", "gemini-pro"} {
+		if fallback != cleanModel {
+			candidateModels = append(candidateModels, fallback)
+		}
+	}
+
+	var lastErr error
+
+	// Try candidate models
+	for _, cand := range candidateModels {
+		// Method 1: Try OpenAI-compatible endpoint first for highest compatibility
+		openaiUrl := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+		reqBodyOpenAI := map[string]interface{}{
+			"model": cand,
+			"messages": []map[string]string{
+				{"role": "system", "content": "You are a specialized systematic literature review screener. Always respond with strict JSON."},
+				{"role": "user", "content": userPrompt},
 			},
-		},
-		"generationConfig": map[string]interface{}{
-			"response_mime_type": "application/json",
-			"temperature":        0.1,
-		},
+			"response_format": map[string]string{"type": "json_object"},
+			"temperature":     0.1,
+		}
+
+		jsonBytes, _ := json.Marshal(reqBodyOpenAI)
+		req, err := http.NewRequestWithContext(ctx, "POST", openaiUrl, bytes.NewReader(jsonBytes))
+		if err == nil {
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+
+			resp, err := s.httpClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+
+				if resp.StatusCode == http.StatusOK {
+					var parsed struct {
+						Choices []struct {
+							Message struct {
+								Content string `json:"content"`
+							} `json:"message"`
+						} `json:"choices"`
+					}
+					if json.Unmarshal(body, &parsed) == nil && len(parsed.Choices) > 0 {
+						return parsed.Choices[0].Message.Content, nil
+					}
+				}
+			}
+		}
+
+		// Method 2: Native generateContent endpoint
+		for _, apiVer := range []string{"v1beta", "v1"} {
+			nativeUrl := fmt.Sprintf("https://generativelanguage.googleapis.com/%s/models/%s:generateContent?key=%s", apiVer, cand, apiKey)
+			reqBodyNative := map[string]interface{}{
+				"contents": []map[string]interface{}{
+					{
+						"role": "user",
+						"parts": []map[string]string{
+							{"text": userPrompt},
+						},
+					},
+				},
+				"generationConfig": map[string]interface{}{
+					"response_mime_type": "application/json",
+					"temperature":        0.1,
+				},
+			}
+
+			jsonBytesNative, _ := json.Marshal(reqBodyNative)
+			reqNative, err := http.NewRequestWithContext(ctx, "POST", nativeUrl, bytes.NewReader(jsonBytesNative))
+			if err != nil {
+				continue
+			}
+
+			reqNative.Header.Set("Content-Type", "application/json")
+			respNative, err := s.httpClient.Do(reqNative)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			defer respNative.Body.Close()
+
+			bodyNative, err := io.ReadAll(respNative.Body)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			if respNative.StatusCode == http.StatusOK {
+				var parsedNative struct {
+					Candidates []struct {
+						Content struct {
+							Parts []struct {
+								Text string `json:"text"`
+							} `json:"parts"`
+						} `json:"content"`
+					} `json:"candidates"`
+				}
+
+				if err := json.Unmarshal(bodyNative, &parsedNative); err == nil {
+					if len(parsedNative.Candidates) > 0 && len(parsedNative.Candidates[0].Content.Parts) > 0 {
+						return parsedNative.Candidates[0].Content.Parts[0].Text, nil
+					}
+				}
+			} else {
+				lastErr = fmt.Errorf("gemini status %d: %s", respNative.StatusCode, string(bodyNative))
+			}
+		}
 	}
 
-	jsonBytes, _ := json.Marshal(reqBody)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBytes))
-	if err != nil {
-		return "", err
+	if lastErr != nil {
+		return "", fmt.Errorf("gemini API failed across candidate models (%v): %w", candidateModels, lastErr)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gemini API status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var parsed struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
-
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("failed to parse Gemini response: %w", err)
-	}
-
-	if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("gemini returned empty candidates")
-	}
-
-	return parsed.Candidates[0].Content.Parts[0].Text, nil
+	return "", fmt.Errorf("gemini API failed to generate content")
 }
 
 // callClaude calls Anthropic Claude API
