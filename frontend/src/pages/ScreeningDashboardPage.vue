@@ -502,12 +502,16 @@ async function setDecision(decision) {
   }
 }
 
-async function runAISuggestion() {
+async function runAISuggestion(overrides = {}) {
   if (!selectedStudy.value) return
   aiLoading.value = true
 
   try {
-    const res = await api.getAISuggestion(selectedStudy.value.studyId)
+    const payload = {}
+    if (overrides.provider) payload.provider = overrides.provider
+    if (overrides.apiKey) payload.apiKey = overrides.apiKey
+
+    const res = await api.getAISuggestion(selectedStudy.value.studyId, payload)
     
     // Update active study
     selectedStudy.value.aiSuggestion = res.data.suggestion

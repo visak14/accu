@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -133,12 +134,15 @@ func (h *ProjectHandler) Upload(w http.ResponseWriter, r *http.Request) {
 	if len(studyDocs) > 0 {
 		_, err = h.db.Studies().InsertMany(ctx, studyDocs)
 		if err != nil {
+			log.Printf("[Upload Error] Failed to insert %d studies: %v", len(studyDocs), err)
 			// Rollback project if studies insert fails
 			_, _ = h.db.Projects().DeleteOne(ctx, bson.M{"projectId": projectId})
 			respondError(w, http.StatusInternalServerError, "Failed to store studies in database: "+err.Error())
 			return
 		}
 	}
+
+	log.Printf("[Upload Success] Created project '%s' (ID: %s) with %d studies", name, projectId, len(studies))
 
 	respondJSON(w, http.StatusCreated, map[string]interface{}{
 		"projectId":    projectId,

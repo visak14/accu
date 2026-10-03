@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -88,11 +89,14 @@ func (h *AIHandler) Suggest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Generate AI Suggestion via LLM Service
+	log.Printf("[AI Screening] Invoking %s (model: %s) for study '%s' (ID: %s)...", provider, model, study.Title, study.StudyId)
 	aiResult, err := h.llm.GenerateAISuggestion(ctx, &project, &study, provider, apiKey, model)
 	if err != nil {
+		log.Printf("[AI Screening Error] Study %s failed: %v", study.StudyId, err)
 		respondError(w, http.StatusBadGateway, "AI screening error: "+err.Error())
 		return
 	}
+	log.Printf("[AI Screening Success] Study %s: %s (confidence: %.2f)", study.StudyId, strings.ToUpper(aiResult.Suggestion), aiResult.Confidence)
 
 	// 5. Update Study in MongoDB
 	now := time.Now().UTC()
@@ -204,10 +208,13 @@ func (h *AIHandler) BatchSuggest(w http.ResponseWriter, r *http.Request) {
 
 	var results []BatchResultItem
 
+	log.Printf("[Batch AI Screening] Starting batch screening of %d studies for project %s with provider %s...", len(studies), projectId, provider)
+
 	for i := range studies {
 		st := &studies[i]
 		aiRes, err := h.llm.GenerateAISuggestion(ctx, &project, st, provider, decryptedApiKey, project.LLMModel)
 		if err != nil {
+			log.Printf("[Batch AI Screening Error] Study %s: %v", st.StudyId, err)
 			results = append(results, BatchResultItem{
 				StudyId: st.StudyId,
 				Title:   st.Title,
@@ -215,6 +222,8 @@ func (h *AIHandler) BatchSuggest(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+
+		log.Printf("[Batch AI Screening Success] Study %s: %s", st.StudyId, strings.ToUpper(aiRes.Suggestion))
 
 		now := time.Now().UTC()
 		aiReasonFormatted := fmt.Sprintf("LLM (%s): '%s'", strings.ToUpper(provider), aiRes.Reasoning)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -273,132 +274,142 @@ func (s *LLMService) callOpenAI(ctx context.Context, apiKey, model, userPrompt s
 	return parsed.Choices[0].Message.Content, nil
 }
 
-// callGemini calls Google Gemini API with robust model normalization and fallbacks
+// callGemini calls Google Gemini API using official REST generateContent endpoint
 func (s *LLMService) callGemini(ctx context.Context, apiKey, model, userPrompt string) (string, error) {
-	if apiKey == "" {
+	cleanKey := strings.TrimSpace(apiKey)
+	if cleanKey == "" {
 		return "", fmt.Errorf("Gemini API key is required. Provide it in project upload or set GEMINI_API_KEY in .env")
 	}
 
 	cleanModel := strings.TrimPrefix(strings.TrimSpace(model), "models/")
-	if cleanModel == "" {
-		cleanModel = "gemini-2.0-flash"
+	if cleanModel == "" || !strings.HasPrefix(cleanModel, "gemini") {
+		cleanModel = "gemini-3.8-flash"
 	}
 
-	// List of candidate models to try in sequence if 404 is encountered
-	candidateModels := []string{cleanModel}
-	for _, fallback := range []string{"gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash-002", "gemini-1.5-pro", "gemini-pro"} {
-		if fallback != cleanModel {
-			candidateModels = append(candidateModels, fallback)
+	type candidate struct {
+		apiVersion string
+		modelName  string
+	}
+
+	candidates := []candidate{
+		{"v1beta", cleanModel},
+		{"v1beta", "gemini-3.8-flash"},
+		{"v1beta", "gemini-1.5-flash-latest"},
+		{"v1beta", "gemini-1.5-pro-latest"},
+		{"v1beta", "gemini-2.0-flash-lite"},
+		{"v1beta", "gemini-1.5-flash-002"},
+		{"v1", "gemini-1.5-flash-latest"},
+	}
+
+	// Deduplicate candidates
+	seen := make(map[string]bool)
+	var uniqueCandidates []candidate
+	for _, c := range candidates {
+		key := c.apiVersion + ":" + c.modelName
+		if !seen[key] {
+			seen[key] = true
+			uniqueCandidates = append(uniqueCandidates, c)
 		}
 	}
 
-	var lastErr error
+	var errorLogs []string
 
-	// Try candidate models
-	for _, cand := range candidateModels {
-		// Method 1: Try OpenAI-compatible endpoint first for highest compatibility
-		openaiUrl := "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-		reqBodyOpenAI := map[string]interface{}{
-			"model": cand,
-			"messages": []map[string]string{
-				{"role": "system", "content": "You are a specialized systematic literature review screener. Always respond with strict JSON."},
-				{"role": "user", "content": userPrompt},
-			},
-			"response_format": map[string]string{"type": "json_object"},
-			"temperature":     0.1,
-		}
+	for _, cand := range uniqueCandidates {
+		endpoint := fmt.Sprintf("https://generativelanguage.googleapis.com/%s/models/%s:generateContent?key=%s", cand.apiVersion, cand.modelName, cleanKey)
 
-		jsonBytes, _ := json.Marshal(reqBodyOpenAI)
-		req, err := http.NewRequestWithContext(ctx, "POST", openaiUrl, bytes.NewReader(jsonBytes))
-		if err == nil {
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-
-			resp, err := s.httpClient.Do(req)
-			if err == nil {
-				defer resp.Body.Close()
-				body, _ := io.ReadAll(resp.Body)
-
-				if resp.StatusCode == http.StatusOK {
-					var parsed struct {
-						Choices []struct {
-							Message struct {
-								Content string `json:"content"`
-							} `json:"message"`
-						} `json:"choices"`
-					}
-					if json.Unmarshal(body, &parsed) == nil && len(parsed.Choices) > 0 {
-						return parsed.Choices[0].Message.Content, nil
-					}
-				}
-			}
-		}
-
-		// Method 2: Native generateContent endpoint
-		for _, apiVer := range []string{"v1beta", "v1"} {
-			nativeUrl := fmt.Sprintf("https://generativelanguage.googleapis.com/%s/models/%s:generateContent?key=%s", apiVer, cand, apiKey)
-			reqBodyNative := map[string]interface{}{
-				"contents": []map[string]interface{}{
-					{
-						"role": "user",
-						"parts": []map[string]string{
-							{"text": userPrompt},
-						},
+		reqBody := map[string]interface{}{
+			"contents": []map[string]interface{}{
+				{
+					"parts": []map[string]string{
+						{"text": userPrompt},
 					},
 				},
-				"generationConfig": map[string]interface{}{
-					"response_mime_type": "application/json",
-					"temperature":        0.1,
-				},
-			}
-
-			jsonBytesNative, _ := json.Marshal(reqBodyNative)
-			reqNative, err := http.NewRequestWithContext(ctx, "POST", nativeUrl, bytes.NewReader(jsonBytesNative))
-			if err != nil {
-				continue
-			}
-
-			reqNative.Header.Set("Content-Type", "application/json")
-			respNative, err := s.httpClient.Do(reqNative)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			defer respNative.Body.Close()
-
-			bodyNative, err := io.ReadAll(respNative.Body)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-
-			if respNative.StatusCode == http.StatusOK {
-				var parsedNative struct {
-					Candidates []struct {
-						Content struct {
-							Parts []struct {
-								Text string `json:"text"`
-							} `json:"parts"`
-						} `json:"content"`
-					} `json:"candidates"`
-				}
-
-				if err := json.Unmarshal(bodyNative, &parsedNative); err == nil {
-					if len(parsedNative.Candidates) > 0 && len(parsedNative.Candidates[0].Content.Parts) > 0 {
-						return parsedNative.Candidates[0].Content.Parts[0].Text, nil
-					}
-				}
-			} else {
-				lastErr = fmt.Errorf("gemini status %d: %s", respNative.StatusCode, string(bodyNative))
-			}
+			},
+			"generationConfig": map[string]interface{}{
+				"responseMimeType": "application/json",
+				"temperature":      0.1,
+			},
 		}
+
+		jsonBytes, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", err
+		}
+
+		// Attempt call up to 3 times for 503 temporary high-demand spikes
+		var resp *http.Response
+		var body []byte
+		var lastStatus int
+
+		for attempt := 1; attempt <= 3; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonBytes))
+			if err != nil {
+				return "", err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", cleanKey)
+
+			resp, err = s.httpClient.Do(req)
+			if err != nil {
+				log.Printf("[Gemini %s/%s attempt %d] HTTP error: %v", cand.apiVersion, cand.modelName, attempt, err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			body, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastStatus = resp.StatusCode
+
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+
+			if resp.StatusCode == 503 || resp.StatusCode == 429 {
+				log.Printf("[Gemini %s/%s attempt %d] High demand (status %d). Retrying in 1.5s...", cand.apiVersion, cand.modelName, attempt, resp.StatusCode)
+				time.Sleep(1500 * time.Millisecond)
+				continue
+			}
+
+			// If status is 404 or other non-retriable, break inner loop to try next candidate
+			break
+		}
+
+		if lastStatus != http.StatusOK {
+			errStr := fmt.Sprintf("[%s/%s status %d: %s]", cand.apiVersion, cand.modelName, lastStatus, strings.TrimSpace(string(body)))
+			log.Println(errStr)
+			errorLogs = append(errorLogs, errStr)
+			continue
+		}
+
+		var parsed struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			errStr := fmt.Sprintf("[%s/%s json parse error: %v]", cand.apiVersion, cand.modelName, err)
+			log.Println(errStr)
+			errorLogs = append(errorLogs, errStr)
+			continue
+		}
+
+		if len(parsed.Candidates) == 0 || len(parsed.Candidates[0].Content.Parts) == 0 {
+			errStr := fmt.Sprintf("[%s/%s empty candidates]", cand.apiVersion, cand.modelName)
+			log.Println(errStr)
+			errorLogs = append(errorLogs, errStr)
+			continue
+		}
+
+		log.Printf("[Gemini Success] Used %s/%s", cand.apiVersion, cand.modelName)
+		return parsed.Candidates[0].Content.Parts[0].Text, nil
 	}
 
-	if lastErr != nil {
-		return "", fmt.Errorf("gemini API failed across candidate models (%v): %w", candidateModels, lastErr)
-	}
-
-	return "", fmt.Errorf("gemini API failed to generate content")
+	return "", fmt.Errorf("all Gemini model candidates failed: %s", strings.Join(errorLogs, " | "))
 }
 
 // callClaude calls Anthropic Claude API

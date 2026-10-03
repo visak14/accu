@@ -6,17 +6,29 @@
         <q-icon name="psychology" color="primary" size="24px" />
         <span class="text-subtitle1 text-weight-bold">AI Screening Assistant</span>
       </div>
-      <q-btn
-        unelevated
-        color="primary"
-        icon="auto_awesome"
-        :label="study?.aiSuggestion ? 'Re-Screen with AI' : 'Run AI Screening'"
-        :loading="loading"
-        :disable="loading || !study"
-        @click="$emit('request-ai-suggest')"
-      >
-        <q-tooltip>Request structured AI screening suggestion (Hotkey: A)</q-tooltip>
-      </q-btn>
+      <div class="row items-center q-gutter-xs">
+        <q-btn
+          flat
+          dense
+          round
+          icon="settings"
+          color="grey-7"
+          @click="showConfigDialog = true"
+        >
+          <q-tooltip>Configure AI Provider & API Key</q-tooltip>
+        </q-btn>
+        <q-btn
+          unelevated
+          color="primary"
+          icon="auto_awesome"
+          :label="study?.aiSuggestion ? 'Re-Screen' : 'Run AI Screening'"
+          :loading="loading"
+          :disable="loading || !study"
+          @click="triggerScreening"
+        >
+          <q-tooltip>Request structured AI screening suggestion (Hotkey: A)</q-tooltip>
+        </q-btn>
+      </div>
     </div>
 
     <q-separator />
@@ -129,11 +141,52 @@
         </q-expansion-item>
       </div>
     </div>
+
+    <!-- AI Provider Config Dialog -->
+    <q-dialog v-model="showConfigDialog">
+      <q-card style="min-width: 380px">
+        <q-card-section>
+          <div class="text-h6">AI Provider Settings</div>
+          <div class="text-caption text-grey-7">Configure which LLM to use for screening</div>
+        </q-card-section>
+        <q-card-section class="q-gutter-md">
+          <q-select
+            v-model="aiProvider"
+            :options="providerOptions"
+            emit-value
+            map-options
+            label="AI Provider"
+            outlined
+            dense
+          />
+          <q-input
+            v-model="aiApiKey"
+            :type="showKey ? 'text' : 'password'"
+            label="API Key"
+            outlined
+            dense
+            hint="Your API key is stored in browser only (localStorage)"
+          >
+            <template #append>
+              <q-icon
+                :name="showKey ? 'visibility_off' : 'visibility'"
+                class="cursor-pointer"
+                @click="showKey = !showKey"
+              />
+            </template>
+          </q-input>
+        </q-card-section>
+        <q-card-actions align="right">
+          <q-btn flat label="Cancel" color="grey" v-close-popup />
+          <q-btn flat label="Save" color="primary" v-close-popup />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
   </q-card>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { ref, computed } from 'vue'
 
 const props = defineProps({
   study: {
@@ -146,8 +199,35 @@ const props = defineProps({
   }
 })
 
-defineEmits(['request-ai-suggest'])
+const emit = defineEmits(['request-ai-suggest'])
 
+// ── AI Provider Config (persisted in localStorage) ──
+const showConfigDialog = ref(false)
+const showKey = ref(false)
+const aiProvider = ref(localStorage.getItem('slr_ai_provider') || 'gemini')
+const aiApiKey = ref(localStorage.getItem('slr_ai_key') || '')
+
+const providerOptions = [
+  { label: 'Groq (Llama)', value: 'groq' },
+  { label: 'OpenAI (GPT)', value: 'openai' },
+  { label: 'Gemini (Google)', value: 'gemini' },
+  { label: 'Claude (Anthropic)', value: 'claude' }
+]
+
+function triggerScreening() {
+  // Persist config to localStorage
+  localStorage.setItem('slr_ai_provider', aiProvider.value)
+  if (aiApiKey.value) {
+    localStorage.setItem('slr_ai_key', aiApiKey.value)
+  }
+  // Emit with overrides so the parent can pass them to the API
+  emit('request-ai-suggest', {
+    provider: aiProvider.value,
+    apiKey: aiApiKey.value
+  })
+}
+
+// ── Computed ──
 const hasAISuggestion = computed(() => {
   return props.study && (props.study.aiSuggestion || props.study.aiJsonResponse)
 })
